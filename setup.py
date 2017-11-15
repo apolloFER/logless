@@ -10,10 +10,11 @@ setup(
     license='MIT',
     url='http://github.com/apolloFER/logless',
     install_requires=[
-        #'logless-lambda',
+        'logless-lambda',
         'click',
         "boto3",
-        "PyYAML"
+        "PyYAML",
+        "tqdm"
     ],
     entry_points='''
     [console_scripts]

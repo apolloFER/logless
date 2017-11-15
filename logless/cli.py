@@ -24,6 +24,17 @@ from tqdm import tqdm
 
 BOTO3_CONFIG_DOCS_URL = 'https://boto3.readthedocs.io/en/latest/guide/quickstart.html#configuration'
 
+HANDLER_TEMPLATE = """import logless_lambda
+
+
+def processor(event, context):
+    for record in logless_lambda.logless_records(event['Records']):
+        \"\"\"
+        Process records received from the logless_lambda library.
+        \"\"\"
+        print("Received record", record.message, record.timestamp, record.level, record.source)
+"""
+
 ASSUME_POLICY = """{
   "Version": "2012-10-17",
   "Statement": [
@@ -192,8 +203,6 @@ def get_current_venv():
             print("This directory seems to have pyenv's local venv, "
                   "but pyenv executable was not found.")
         with open('.python-version', 'r') as f:
-            # minor fix in how .python-version is read
-            # Related: https://github.com/Miserlou/Zappa/issues/921
             env_name = f.readline().strip()
         bin_path = subprocess.check_output(['pyenv', 'which', 'python']).decode('utf-8')
         venv = bin_path[:bin_path.rfind(env_name)] + env_name
@@ -353,13 +362,6 @@ def create_lambda_zip(settings, handler_file, exclude):
     for root, dirs, files in os.walk(temp_project_path):
 
         for filename in files:
-
-            # Skip .pyc files for Django migrations
-            # https://github.com/Miserlou/Zappa/issues/436
-            # https://github.com/Miserlou/Zappa/issues/464
-            if filename[-4:] == '.pyc' and root[-10:] == 'migrations':
-                continue
-
             # If there is a .pyc file in this package,
             # we can skip the python source code as we'll just
             # use the compiled bytecode anyway..
@@ -377,13 +379,10 @@ def create_lambda_zip(settings, handler_file, exclude):
                         continue
 
             # Make sure that the files are all correctly chmodded
-            # Related: https://github.com/Miserlou/Zappa/issues/484
-            # Related: https://github.com/Miserlou/Zappa/issues/682
             os.chmod(os.path.join(root, filename), 0o755)
 
 
             # Actually put the file into the proper place in the zip
-            # Related: https://github.com/Miserlou/Zappa/pull/716
             zipi = zipfile.ZipInfo(os.path.join(root.replace(temp_project_path, '').lstrip(os.sep), filename))
             zipi.create_system = 3
             zipi.external_attr = 0o755 << int(16)  # Is this P2/P3 functional?
@@ -392,7 +391,6 @@ def create_lambda_zip(settings, handler_file, exclude):
 
         # Create python init file if it does not exist
         # Only do that if there are sub folders or python files and does not conflict with a neighbouring module
-        # Related: https://github.com/Miserlou/Zappa/issues/766
         if not contains_python_files_or_subdirs(root):
             # if the directory does not contain any .py file at any level, we can skip the rest
             dirs[:] = [d for d in dirs if d != root]
@@ -424,10 +422,8 @@ def create_package(settings):
     handler_file = os.sep.join(current_file.split(os.sep)[0:]) + os.sep + 'handler.py'
 
     # Custom excludes for different versions.
-    # Related: https://github.com/kennethreitz/requests/issues/3985
     if sys.version_info[0] < 3:
         # Exclude packages already builtin to the python lambda environment
-        # Related: https://github.com/Miserlou/Zappa/issues/556
         exclude = [
             "boto3",
             "dateutil",
@@ -453,6 +449,45 @@ def create_package(settings):
         raise click.ClickException("Unable to upload to S3. Quitting.")
 
     return zip_path
+
+
+def remove_local_file(zip_path):
+    try:
+        if os.path.isfile(zip_path):
+            os.remove(zip_path)
+    except Exception as e:  # pragma: no cover
+        sys.exit(-1)
+
+
+def remove_from_s3(file_name, bucket_name):
+    """
+    Given a file name and a bucket, remove it from S3.
+    There's no reason to keep the file hosted on S3 once its been made into a Lambda function, so we can delete it from S3.
+    Returns True on success, False on failure.
+    """
+    s3_client = boto3.client("s3")
+
+    try:
+        s3_client.head_bucket(Bucket=bucket_name)
+    except botocore.exceptions.ClientError as e:  # pragma: no cover
+        # If a client error is thrown, then check that it was a 404 error.
+        # If it was a 404 error, then the bucket does not exist.
+        error_code = int(e.response['Error']['Code'])
+        if error_code == 404:
+            return False
+
+    try:
+        s3_client.delete_object(Bucket=bucket_name, Key=file_name)
+        return True
+    except botocore.exceptions.ClientError:  # pragma: no cover
+        return False
+
+
+def delete_zip_package(settings, zip_path):
+    logless_id = settings["logless_id"]
+
+    remove_from_s3(zip_path, logless_id)
+    remove_local_file(zip_path)
 
 
 def get_credentials_arn(logless_id, region):
@@ -561,13 +596,22 @@ def create_lambda(settings, zip_path):
     return lambda_arn
 
 
+def update_lambda(settings, zip_path):
+    region = settings["aws_region"]
+    logless_id = settings["logless_id"]
+
+    lambda_client = boto3.client("lambda", region_name=region)
+
+    lambda_client.update_function_code(FunctionName=logless_id, Publish=True, S3Bucket=logless_id, S3Key=zip_path)
+
+
 def create_event_trigger(settings, kinesis_arn):
     region = settings["aws_region"]
     logless_id = settings["logless_id"]
 
     lambda_client = boto3.client("lambda", region_name=region)
 
-    click.echo("\nConnecting Kinesis and Lambda!\n")
+    click.echo("\nConnecting Kinesis and Lambda!")
 
     lambda_client.create_event_source_mapping(EventSourceArn=kinesis_arn,
                                               FunctionName=logless_id,
@@ -669,6 +713,15 @@ def init():
     with open("logless_settings.yaml", "w") as logless_yaml_file:
         logless_yaml_file.write(logless_settings_yaml)
 
+    with open("handler.py", "w") as handler_file:
+        handler_file.write(HANDLER_TEMPLATE)
+
+    click.echo("\nGenerating handler code!")
+
+    click.echo("\nYou can find the handler template code in the "
+               + click.style("handler.py", bold=True)
+               + " file. Put your procesing code there.")
+
     click.echo("\n" + click.style("Done", bold=True)
                + "! Now you can "
                + click.style("deploy",
@@ -687,20 +740,34 @@ def deploy():
 
     create_policy(logless_settings)
 
-    zipfile = create_package(logless_settings)
+    zip_file = create_package(logless_settings)
 
     kinesis_arn = create_kinesis(logless_settings)
 
-    create_lambda(logless_settings, zipfile)
+    create_lambda(logless_settings, zip_file)
 
     create_event_trigger(logless_settings, kinesis_arn)
+
+    delete_zip_package(logless_settings, zip_file)
 
     click.echo("\nLogLess sucessfully deployed. "
                + "You can start generating logs from Python and Golang using the logless libraries.")
     click.echo("Use " + click.style(logless_id, bold=True) + " as Kinesis stream in your application.")
 
-    click.echo("\nAfter changing you handler code, you can " + click.style("update", bold=True) + " it with:\n")
+    click.echo("\nAfter changing your handler code, you can " + click.style("update", bold=True) + " it with:\n")
     click.echo(click.style("\t$ logless update\n", bold=True))
+
+
+@cli.command()
+def update():
+    logless_settings = load_settings()
+
+    zip_file = create_package(logless_settings)
+
+    update_lambda(logless_settings, zip_file)
+
+    delete_zip_package(logless_settings, zip_file)
+
 
 def main():
     cli(obj={}, auto_envvar_prefix="LOGLESS")
